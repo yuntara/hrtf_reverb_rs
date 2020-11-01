@@ -1,17 +1,27 @@
 use super::*;
 pub use lib::hrtf_data::*;
 pub use model::*;
-
 use std::collections::VecDeque;
+use std::sync::Arc;
+extern crate crossbeam;
+
 #[derive(Debug, Clone)]
-pub struct RayNodes {
+pub struct Options {
     room: Room,
-    list: VecDeque<RayWithAttributes>,
     speaker: Speaker,
     receivers: Vec<Receiver>,
     max_dist: Float,
     min_intensity: Float,
-    hrtf: std::sync::Arc<HRTFData>,
+}
+#[derive(Debug, Clone)]
+pub struct RayNodes<Context, Callback: 'static>
+where
+    Callback: Fn(&mut Context, ReceiveEvent),
+{
+    list: VecDeque<RayWithAttributes>,
+    options: Options,
+    context: Context,
+    on_receive: std::sync::Arc<Callback>,
 }
 #[derive(Debug, Clone)]
 pub struct ReceiveEvent {
@@ -26,41 +36,84 @@ pub struct AdjustResult {
     pub intensity: Float,
     pub delay: Float,
 }
-impl RayNodes {
-    pub fn new(hrtf: HRTFData) -> RayNodes {
-        RayNodes {
+pub trait ThreadContext<'a, T> {
+    fn new(opt: &T) -> Self;
+}
+impl Options {
+    pub fn default() -> Self {
+        Options {
             room: Room::new(),
-            list: VecDeque::new(),
             max_dist: 1e2,
             min_intensity: 1e-1,
             speaker: Speaker::new(),
             receivers: vec![],
-            hrtf: std::sync::Arc::new(hrtf),
         }
     }
-    pub fn multi_simulate<U>(max_threads: u32, hrtf: HRTFData) {
-        if max_threads == 0 {
-            panic!("thread max number must not be 0.");
-        }
+}
+
+pub fn multi_simulate<
+    'a,
+    T: Send + Sync,
+    Context: ThreadContext<'a, T> + Send + Sync,
+    Callback: 'static + Send + Sync,
+>(
+    max_threads: u32,
+    on_receive: Callback,
+    options: Options,
+    ctx_opt: T,
+) -> Vec<Context>
+where
+    Callback: Fn(&mut Context, ReceiveEvent),
+{
+    if max_threads == 0 {
+        panic!("thread max number must not be 0.");
+    }
+    let result = crossbeam::scope(|scope| {
         let mut threads = vec![];
-        let arc_hrtf = std::sync::Arc::new(hrtf);
+        let callback = std::sync::Arc::new(on_receive);
+        let mut contexts: Vec<Context> = vec![];
         for i in 0..max_threads {
-            let mut nodes = RayNodes {
-                room: Room::new(),
-                list: VecDeque::new(),
-                max_dist: 1e2,
-                min_intensity: 1e-1,
-                speaker: Speaker::new(),
-                receivers: vec![],
-                hrtf: arc_hrtf.clone(),
-            };
-            threads.push(std::thread::spawn(move || {
-                nodes.first_by(i, max_threads);
-                nodes.simulate();
-            }));
+            let opt = options.clone();
+            let context = Context::new(&ctx_opt);
+            let mut node = RayNodes::new(context, callback.clone(), opt);
+            let handle = scope.spawn(move |_| {
+                node.first_by(i, max_threads);
+                node.simulate();
+                node.context
+            });
+            threads.push(handle);
         }
         for thread in threads {
-            let _ = thread.join();
+            let result = thread.join();
+            if let Ok(context) = result {
+                contexts.push(context);
+            } else {
+                panic!("at least 1 thread finished abnormally");
+            }
+        }
+        contexts
+    });
+    if let Ok(contexts) = result {
+        contexts
+    } else {
+        panic!("finished erroneously")
+    }
+}
+
+impl<Context, Callback: 'static + Send + Sync> RayNodes<Context, Callback>
+where
+    Callback: Fn(&mut Context, ReceiveEvent),
+{
+    pub fn new(
+        context: Context,
+        on_receive: Arc<Callback>,
+        options: Options,
+    ) -> RayNodes<Context, Callback> {
+        RayNodes {
+            list: VecDeque::new(),
+            options,
+            context,
+            on_receive,
         }
     }
     pub fn receive_from(
@@ -73,7 +126,7 @@ impl RayNodes {
     ) {
         let cos_phi_max = phi_max.cos();
 
-        for receiver in self.receivers.iter() {
+        for receiver in self.options.receivers.iter() {
             let d = receiver.pos - pos;
             let dist = d.norm2().sqrt();
             let d_normed = d / dist;
@@ -87,16 +140,19 @@ impl RayNodes {
                 // r^2 / (2*dist^2*(1-cos()))
                 let intensity_ratio =
                     receiver.r * receiver.r / (2.0 * dist * dist * (1.0 - cos_phi_max));
-                let data = self.hrtf.adjust(ReceiveEvent {
-                    dist: prev_dist + dist,
-                    intensity: intensity * intensity_ratio,
-                    vec: d_normed,
-                });
+                (self.on_receive)(
+                    &mut self.context,
+                    ReceiveEvent {
+                        dist: prev_dist + dist,
+                        intensity: intensity * intensity_ratio,
+                        vec: d_normed,
+                    },
+                );
             }
         }
     }
     pub fn first_by(&mut self, num: u32, max_num: u32) {
-        let speaker = self.speaker.clone();
+        let speaker = self.options.speaker.clone();
         let total = speaker.theta_resolution * speaker.phi_resolution;
         let min = total * num / max_num;
         let max = total * (num + 1) / max_num;
@@ -169,7 +225,7 @@ impl RayNodes {
         let intensity_base =
             intensity * (1.0 - poly.mat.absorption_ratio) * (poly.mat.scattering_ratio);
         let intensity = intensity_base / ((theta_resolution * phi_resolution) as Float);
-        if intensity < self.min_intensity {
+        if intensity < self.options.min_intensity {
             return false;
         }
         self.receive_from(
@@ -205,7 +261,7 @@ impl RayNodes {
     pub fn update(&mut self) -> bool {
         let intersection = {
             let first = &self.list[0].ray;
-            self.room.find_intersection(first)
+            self.options.room.find_intersection(first)
         };
         if let Some(intr) = intersection {
             let (poly, pos) = intr;
@@ -230,7 +286,7 @@ impl RayNodes {
                 self.list.pop_front();
                 return false;
             }
-            if first.dist > self.max_dist || first.intensity < self.min_intensity {
+            if first.dist > self.options.max_dist || first.intensity < self.options.min_intensity {
                 self.list.pop_front();
                 return false;
             }
