@@ -64,10 +64,10 @@ impl<'a> ThreadContext<'a, ContextInitOptions<'a>> for Context<'a> {
     }
 }
 impl std::ops::AddAssign for Filter {
-    fn add_assign(&mut self, other: Self) {}
+    fn add_assign(&mut self, _other: Self) {}
 }
 impl Reverbrator {
-    fn on_receive(ctx: &mut Context, event: ReceiveEvent) -> () {}
+    fn on_receive(_ctx: std::cell::RefMut<Context>, _event: ReceiveEvent) -> () {}
     fn merge_contexts(contexts: Vec<Context>) -> CoefVec {
         let mut c = CoefVec::empty();
         for ctx in contexts.into_iter() {

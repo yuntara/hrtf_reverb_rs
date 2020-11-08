@@ -1,6 +1,7 @@
-use super::*;
+pub use super::*;
 pub use lib::hrtf_data::*;
 pub use model::*;
+use std::cell::{RefCell, RefMut};
 use std::collections::VecDeque;
 use std::sync::Arc;
 extern crate crossbeam;
@@ -16,11 +17,11 @@ pub struct Options {
 #[derive(Debug, Clone)]
 pub struct RayNodes<Context, Callback: 'static>
 where
-    Callback: Fn(&mut Context, ReceiveEvent),
+    Callback: Fn(RefMut<Context>, ReceiveEvent),
 {
-    list: VecDeque<RayWithAttributes>,
+    list: RefCell<VecDeque<RayWithAttributes>>,
     options: Options,
-    context: Context,
+    context: RefCell<Context>,
     on_receive: std::sync::Arc<Callback>,
 }
 #[derive(Debug, Clone)]
@@ -63,7 +64,7 @@ pub fn multi_simulate<
     ctx_opt: T,
 ) -> Vec<Context>
 where
-    Callback: Fn(&mut Context, ReceiveEvent),
+    Callback: Fn(RefMut<Context>, ReceiveEvent),
 {
     if max_threads == 0 {
         panic!("thread max number must not be 0.");
@@ -74,12 +75,13 @@ where
         let mut contexts: Vec<Context> = vec![];
         for i in 0..max_threads {
             let opt = options.clone();
+            let cb = callback.clone();
             let context = Context::new(&ctx_opt);
-            let mut node = RayNodes::new(context, callback.clone(), opt);
             let handle = scope.spawn(move |_| {
+                let node = RayNodes::new(context, cb, opt);
                 node.first_by(i, max_threads);
                 node.simulate();
-                node.context
+                node.context.into_inner()
             });
             threads.push(handle);
         }
@@ -102,7 +104,7 @@ where
 
 impl<Context, Callback: 'static + Send + Sync> RayNodes<Context, Callback>
 where
-    Callback: Fn(&mut Context, ReceiveEvent),
+    Callback: Fn(RefMut<Context>, ReceiveEvent),
 {
     pub fn new(
         context: Context,
@@ -110,14 +112,14 @@ where
         options: Options,
     ) -> RayNodes<Context, Callback> {
         RayNodes {
-            list: VecDeque::new(),
+            list: RefCell::new(VecDeque::new()),
             options,
-            context,
+            context: RefCell::new(context),
             on_receive,
         }
     }
     pub fn receive_from(
-        &mut self,
+        &self,
         pos: Vector,
         norm: Vector,
         phi_max: Float,
@@ -141,7 +143,7 @@ where
                 let intensity_ratio =
                     receiver.r * receiver.r / (2.0 * dist * dist * (1.0 - cos_phi_max));
                 (self.on_receive)(
-                    &mut self.context,
+                    self.context.borrow_mut(),
                     ReceiveEvent {
                         dist: prev_dist + dist,
                         intensity: intensity * intensity_ratio,
@@ -151,7 +153,7 @@ where
             }
         }
     }
-    pub fn first_by(&mut self, num: u32, max_num: u32) {
+    pub fn first_by(&self, num: u32, max_num: u32) {
         let speaker = self.options.speaker.clone();
         let total = speaker.theta_resolution * speaker.phi_resolution;
         let min = total * num / max_num;
@@ -183,16 +185,16 @@ where
             self.add_ray(new_ray);
         }
     }
-    pub fn simulate(&mut self) -> bool {
-        while !self.list.is_empty() {
+    pub fn simulate(&self) -> bool {
+        while !self.list.borrow().is_empty() {
             self.update();
         }
         true
     }
-    pub fn add_ray(&mut self, ray: RayWithAttributes) {
-        self.list.push_front(ray);
+    pub fn add_ray(&self, ray: RayWithAttributes) {
+        self.list.borrow_mut().push_front(ray);
     }
-    pub fn on_refrect(ray: &mut RayWithAttributes, poly: &Polygon) -> bool {
+    pub fn on_refrect(_ray: &mut RayWithAttributes, _poly: &Polygon) -> bool {
         true
     }
     pub fn orthogonal(v: Vector) -> Vector {
@@ -209,13 +211,7 @@ where
             panic!("origin vector must not be zero vector");
         }
     }
-    pub fn add_scatters(
-        &mut self,
-        ray: &RayWithAttributes,
-        poly: &Polygon,
-        position: &Vector,
-        intensity: Float,
-    ) -> bool {
+    pub fn add_scatters(&self, ray: &RayWithAttributes, poly: &Polygon, intensity: Float) -> bool {
         let norm = poly.norm();
         let c_x = Self::orthogonal(norm);
         let c_y = Vector::cross(norm, c_x);
@@ -258,14 +254,19 @@ where
         }
         true
     }
-    pub fn update(&mut self) -> bool {
+    pub fn update(&self) -> bool {
+        if self.list.borrow().len() == 0 {
+            return false;
+        }
         let intersection = {
-            let first = &self.list[0].ray;
-            self.options.room.find_intersection(first)
+            let list = self.list.borrow();
+            let first = list.front().unwrap();
+
+            self.options.room.find_intersection(&first.ray)
         };
         if let Some(intr) = intersection {
             let (poly, pos) = intr;
-            let mut first = self.list[0].clone();
+            let mut first = self.list.borrow().front().unwrap().clone();
             let intensity = first.intensity.clone();
             let ref_vec = Room::refrect(&first.ray, &poly);
             first.ray.norm = ref_vec;
@@ -283,20 +284,21 @@ where
                 first.dist,
             );
             if !Self::on_refrect(&mut first, &poly) {
-                self.list.pop_front();
+                self.list.borrow_mut().pop_front();
                 return false;
             }
             if first.dist > self.options.max_dist || first.intensity < self.options.min_intensity {
-                self.list.pop_front();
+                self.list.borrow_mut().pop_front();
                 return false;
             }
-            self.list[0] = first;
-
-            let cloned = self.list[0].clone();
-            self.add_scatters(&cloned, &poly, &pos, intensity);
+            let cloned = first.clone();
+            {
+                self.list.borrow_mut()[0] = first;
+            }
+            self.add_scatters(&cloned, &poly, intensity);
             return true;
         }
-        self.list.pop_front();
+        self.list.borrow_mut().pop_front();
         false
     }
 }

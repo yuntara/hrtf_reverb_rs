@@ -24,6 +24,8 @@ impl HRTFRawData {
             if type_str != "FIR" {
                 return Err(Error::new("data type must be FIR"));
             }
+        } else {
+            return Err(Error::new("data type must be FIR"));
         }
 
         Ok(())
