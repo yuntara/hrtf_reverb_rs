@@ -443,6 +443,7 @@ name = "reverb"
 version = "0.1.0"
 dependencies = [
  "crossbeam",
+ "ndarray",
  "netcdf",
  "vector3d",
 ]

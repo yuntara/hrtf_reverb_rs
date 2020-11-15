@@ -10,5 +10,6 @@ rustflags = ["-C", "link-args=-e __start -static -nostartfiles"]
 [features]
 [dependencies]
 vector3d = "0.1.9"
+ndarray = "0.13.0"
 netcdf = {version="0.5.1",features=["static"]}
 crossbeam = "0.8"

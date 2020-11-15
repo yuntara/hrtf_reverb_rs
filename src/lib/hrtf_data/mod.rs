@@ -1,8 +1,8 @@
-pub mod hrtf_raw;
+pub mod sofa_fir;
 
 pub use super::*;
-pub use hrtf_raw::*;
 pub use lib::ray_nodes::*;
+pub use sofa_fir::*;
 
 #[derive(Debug, Clone)]
 pub struct SourcePosition {
